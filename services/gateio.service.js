@@ -14,15 +14,16 @@ class GateIOService {
   /**
    * Створює HMAC-SHA512 підпис для автентифікації
    */
-  generateSignature(method, urlPath, queryString, bodyString, timestamp) {
+  generateSignature(method, endpoint, queryString, bodyString, timestamp) {
     // Обчислюємо SHA512 хеш від body
     const bodyHash = crypto
       .createHash('sha512')
       .update(bodyString || '')
       .digest('hex');
 
+    // ВАЖЛИВО: endpoint вже містить /api/v4, НЕ додаємо його знову!
     // Формуємо signature string згідно документації
-    const signatureString = `${method}\n${urlPath}\n${queryString}\n${bodyHash}\n${timestamp}`;
+    const signatureString = `${method}\n${endpoint}\n${queryString}\n${bodyHash}\n${timestamp}`;
 
     // Створюємо HMAC-SHA512 підпис
     const signature = crypto
@@ -32,7 +33,7 @@ class GateIOService {
 
     logger.info('[GATEIO] Signature generation:');
     logger.info(`  Method: ${method}`);
-    logger.info(`  URL Path: ${urlPath}`);
+    logger.info(`  Endpoint: ${endpoint}`);
     logger.info(`  Query: ${queryString || '(empty)'}`);
     logger.info(`  Body hash: ${bodyHash}`);
     logger.info(`  Timestamp: ${timestamp}`);
@@ -80,7 +81,10 @@ class GateIOService {
    */
   async privateRequest(method, endpoint, queryParams = {}, body = null) {
     const timestamp = Math.floor(Date.now() / 1000).toString();
-    const urlPath = endpoint;
+    
+    // Для підпису використовуємо повний path з /api/v4
+    const signaturePath = `/api/v4${endpoint}`;
+    
     const queryString = Object.keys(queryParams).length > 0
       ? Object.keys(queryParams)
           .sort()
@@ -89,7 +93,7 @@ class GateIOService {
       : '';
     
     const bodyString = body ? JSON.stringify(body) : '';
-    const signature = this.generateSignature(method, urlPath, queryString, bodyString, timestamp);
+    const signature = this.generateSignature(method, signaturePath, queryString, bodyString, timestamp);
 
     const url = `${this.baseURL}${endpoint}${queryString ? '?' + queryString : ''}`;
 
