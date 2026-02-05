@@ -1,24 +1,133 @@
-import GateApi from 'gate-api';
+import crypto from 'crypto';
+import axios from 'axios';
 import { config } from '../config/settings.js';
 import logger from '../utils/logger.js';
 
 class GateIOService {
   constructor() {
-    this.client = null;
-    this.apiClient = null;
+    this.baseURL = 'https://api.gateio.ws/api/v4';
+    this.apiKey = config.gateio.apiKey;
+    this.apiSecret = config.gateio.apiSecret;
     this.isConnected = false;
   }
 
   /**
-   * Ініціалізує клієнт Gate.io API
+   * Створює HMAC-SHA512 підпис для автентифікації
    */
-  initializeClient() {
-    if (!this.client) {
-      this.apiClient = new GateApi.ApiClient();
-      this.apiClient.basePath = config.gateio.baseURL;
-      this.apiClient.setApiKeySecret(config.gateio.apiKey, config.gateio.apiSecret);
-      
-      this.client = new GateApi.FuturesApi(this.apiClient);
+  generateSignature(method, urlPath, queryString, bodyString, timestamp) {
+    // Обчислюємо SHA512 хеш від body
+    const bodyHash = crypto
+      .createHash('sha512')
+      .update(bodyString || '')
+      .digest('hex');
+
+    // Формуємо signature string згідно документації
+    const signatureString = `${method}\n${urlPath}\n${queryString}\n${bodyHash}\n${timestamp}`;
+
+    // Створюємо HMAC-SHA512 підпис
+    const signature = crypto
+      .createHmac('sha512', this.apiSecret)
+      .update(signatureString)
+      .digest('hex');
+
+    logger.info('[GATEIO] Signature generation:');
+    logger.info(`  Method: ${method}`);
+    logger.info(`  URL Path: ${urlPath}`);
+    logger.info(`  Query: ${queryString || '(empty)'}`);
+    logger.info(`  Body hash: ${bodyHash}`);
+    logger.info(`  Timestamp: ${timestamp}`);
+    logger.info(`  Signature string: ${signatureString.replace(/\n/g, '\\n')}`);
+
+    return signature;
+  }
+
+  /**
+   * Виконує PUBLIC запит (без автентифікації)
+   */
+  async publicRequest(method, endpoint) {
+    const url = `${this.baseURL}${endpoint}`;
+
+    try {
+      logger.info(`[GATEIO] PUBLIC REQUEST:`);
+      logger.info(`  Method: ${method}`);
+      logger.info(`  URL: ${url}`);
+
+      const response = await axios({
+        method,
+        url,
+        headers: {
+          'Content-Type': 'application/json'
+        }
+      });
+
+      logger.info(`[GATEIO] PUBLIC RESPONSE:`);
+      logger.info(`  Status: ${response.status}`);
+      logger.info(`  Headers: ${JSON.stringify(response.headers)}`);
+      logger.info(`  Body: ${JSON.stringify(response.data).substring(0, 500)}...`);
+
+      return response.data;
+    } catch (error) {
+      logger.error(`[GATEIO] PUBLIC REQUEST ERROR:`);
+      logger.error(`  Status: ${error.response?.status}`);
+      logger.error(`  Message: ${error.message}`);
+      logger.error(`  Response: ${JSON.stringify(error.response?.data)}`);
+      throw error;
+    }
+  }
+
+  /**
+   * Виконує PRIVATE запит (з автентифікацією)
+   */
+  async privateRequest(method, endpoint, queryParams = {}, body = null) {
+    const timestamp = Math.floor(Date.now() / 1000).toString();
+    const urlPath = endpoint;
+    const queryString = Object.keys(queryParams).length > 0
+      ? Object.keys(queryParams)
+          .sort()
+          .map(key => `${key}=${queryParams[key]}`)
+          .join('&')
+      : '';
+    
+    const bodyString = body ? JSON.stringify(body) : '';
+    const signature = this.generateSignature(method, urlPath, queryString, bodyString, timestamp);
+
+    const url = `${this.baseURL}${endpoint}${queryString ? '?' + queryString : ''}`;
+
+    const headers = {
+      'KEY': this.apiKey,
+      'Timestamp': timestamp,
+      'SIGN': signature,
+      'Content-Type': 'application/json'
+    };
+
+    try {
+      logger.info(`[GATEIO] PRIVATE REQUEST:`);
+      logger.info(`  Method: ${method}`);
+      logger.info(`  URL: ${url}`);
+      logger.info(`  Headers (без секретів):`);
+      logger.info(`    KEY: ${this.apiKey.substring(0, 10)}...`);
+      logger.info(`    Timestamp: ${timestamp}`);
+      logger.info(`    SIGN: ${signature.substring(0, 20)}...`);
+      logger.info(`  Body: ${bodyString || '(empty)'}`);
+
+      const response = await axios({
+        method,
+        url,
+        headers,
+        data: body || undefined
+      });
+
+      logger.info(`[GATEIO] PRIVATE RESPONSE:`);
+      logger.info(`  Status: ${response.status}`);
+      logger.info(`  Body: ${JSON.stringify(response.data).substring(0, 500)}...`);
+
+      return response.data;
+    } catch (error) {
+      logger.error(`[GATEIO] PRIVATE REQUEST ERROR:`);
+      logger.error(`  Status: ${error.response?.status}`);
+      logger.error(`  Message: ${error.message}`);
+      logger.error(`  Response: ${JSON.stringify(error.response?.data)}`);
+      throw error;
     }
   }
 
@@ -39,30 +148,84 @@ class GateIOService {
   }
 
   /**
-   * Перевіряє з'єднання з API
+   * КРОК 1: PUBLIC TEST - список контрактів
+   */
+  async testPublicConnection() {
+    try {
+      logger.info('[GATEIO] ========================================');
+      logger.info('[GATEIO] STEP 1: PUBLIC CONNECTION TEST');
+      logger.info('[GATEIO] ========================================');
+
+      const contracts = await this.publicRequest('GET', '/futures/usdt/contracts');
+
+      if (contracts && Array.isArray(contracts) && contracts.length > 0) {
+        logger.info(`[GATEIO] ✅ PUBLIC TEST PASSED`);
+        logger.info(`[GATEIO] Found ${contracts.length} contracts`);
+        logger.info(`[GATEIO] Sample: ${contracts[0].name}`);
+        return true;
+      } else {
+        throw new Error('Invalid public response');
+      }
+    } catch (error) {
+      logger.error(`[GATEIO] ❌ PUBLIC TEST FAILED: ${error.message}`);
+      throw error;
+    }
+  }
+
+  /**
+   * КРОК 2: PRIVATE AUTH TEST - баланс акаунта
+   */
+  async testPrivateConnection() {
+    try {
+      logger.info('[GATEIO] ========================================');
+      logger.info('[GATEIO] STEP 2: PRIVATE AUTH TEST');
+      logger.info('[GATEIO] ========================================');
+
+      const account = await this.privateRequest('GET', '/futures/usdt/accounts');
+
+      if (account && account.total !== undefined) {
+        logger.info(`[GATEIO] ✅ PRIVATE AUTH TEST PASSED`);
+        logger.info(`[GATEIO] Account total: ${account.total} USDT`);
+        logger.info(`[GATEIO] Account available: ${account.available} USDT`);
+        return true;
+      } else {
+        throw new Error('Invalid private response');
+      }
+    } catch (error) {
+      logger.error(`[GATEIO] ❌ PRIVATE AUTH TEST FAILED: ${error.message}`);
+      throw error;
+    }
+  }
+
+  /**
+   * Головний метод підключення
    */
   async connect() {
     try {
-      logger.info('[GATEIO] Connecting to Gate.io API...');
-      
-      this.initializeClient();
-      
-      const response = await this.client.listFuturesAccounts('usdt');
-      
-      if (response && response.body) {
-        this.isConnected = true;
-        logger.info(`[GATEIO] ✅ Connected to Gate.io MAINNET`);
-        logger.info(`[GATEIO] Position mode: ${config.gateio.positionMode}`);
-        return true;
-      } else {
-        throw new Error('Invalid API response');
-      }
+      logger.info('[GATEIO] ========================================');
+      logger.info('[GATEIO] CONNECTING TO GATE.IO API v4');
+      logger.info('[GATEIO] ========================================');
+      logger.info(`[GATEIO] Base URL: ${this.baseURL}`);
+      logger.info(`[GATEIO] API Key: ${this.apiKey.substring(0, 10)}...`);
+      logger.info(`[GATEIO] Position mode: ${config.gateio.positionMode}`);
+
+      // КРОК 1: Public test
+      await this.testPublicConnection();
+
+      // КРОК 2: Private auth test
+      await this.testPrivateConnection();
+
+      this.isConnected = true;
+      logger.info('[GATEIO] ========================================');
+      logger.info('[GATEIO] ✅ CONNECTION SUCCESSFUL');
+      logger.info('[GATEIO] ========================================');
+
+      return true;
     } catch (error) {
-      logger.error(`[GATEIO] Connection failed: ${error.message}`);
-      if (error.response && error.response.body) {
-        logger.error(`[GATEIO] Response: ${JSON.stringify(error.response.body)}`);
-      }
       this.isConnected = false;
+      logger.error('[GATEIO] ========================================');
+      logger.error('[GATEIO] ❌ CONNECTION FAILED');
+      logger.error('[GATEIO] ========================================');
       throw error;
     }
   }
@@ -72,15 +235,7 @@ class GateIOService {
    */
   async getUSDTBalance() {
     try {
-      this.initializeClient();
-      
-      const response = await this.client.listFuturesAccounts('usdt');
-      
-      if (!response || !response.body) {
-        throw new Error('Failed to get balance: Invalid response');
-      }
-
-      const account = response.body;
+      const account = await this.privateRequest('GET', '/futures/usdt/accounts');
       const availableBalance = parseFloat(account.available || '0');
       
       logger.info(`[GATEIO] USDT Balance: ${availableBalance} USDT`);
@@ -97,16 +252,9 @@ class GateIOService {
    */
   async getSymbolInfo(symbol) {
     try {
-      this.initializeClient();
-      
       const contract = this.formatSymbol(symbol);
-      const response = await this.client.getFuturesContract('usdt', contract);
+      const contractInfo = await this.publicRequest('GET', `/futures/usdt/contracts/${contract}`);
       
-      if (!response || !response.body) {
-        throw new Error(`Contract ${contract} not found`);
-      }
-
-      const contractInfo = response.body;
       const orderSizeMin = parseFloat(contractInfo.order_size_min || '1');
       const orderPriceRound = parseFloat(contractInfo.order_price_round || '0.01');
       const pricePrecision = Math.abs(Math.floor(Math.log10(orderPriceRound)));
@@ -131,18 +279,14 @@ class GateIOService {
    */
   async getCurrentPrice(symbol) {
     try {
-      this.initializeClient();
-      
       const contract = this.formatSymbol(symbol);
-      const response = await this.client.listFuturesTickers('usdt', { contract });
+      const tickers = await this.publicRequest('GET', `/futures/usdt/tickers?contract=${contract}`);
       
-      if (!response || !response.body || response.body.length === 0) {
+      if (!tickers || tickers.length === 0) {
         throw new Error(`Ticker for ${contract} not found`);
       }
 
-      const ticker = response.body[0];
-      const lastPrice = parseFloat(ticker.last);
-      
+      const lastPrice = parseFloat(tickers[0].last);
       logger.info(`[GATEIO] Current price for ${symbol}: ${lastPrice}`);
       
       return lastPrice;
@@ -157,17 +301,18 @@ class GateIOService {
    */
   async setLeverage(symbol, leverage) {
     try {
-      this.initializeClient();
-      
       logger.info(`[GATEIO] Setting leverage ${leverage}x for ${symbol}...`);
       
       const contract = this.formatSymbol(symbol);
-      
+      const body = { leverage: leverage.toString() };
+
       if (config.gateio.positionMode === 'dual_mode') {
-        await this.client.updatePositionLeverage('usdt', contract, leverage.toString(), { mode: 'long' });
-        await this.client.updatePositionLeverage('usdt', contract, leverage.toString(), { mode: 'short' });
+        // Для dual mode встановлюємо окремо для long і short
+        await this.privateRequest('POST', `/futures/usdt/positions/${contract}/leverage`, {}, { ...body, mode: 'long' });
+        await this.privateRequest('POST', `/futures/usdt/positions/${contract}/leverage`, {}, { ...body, mode: 'short' });
       } else {
-        await this.client.updatePositionLeverage('usdt', contract, leverage.toString());
+        // Для single mode
+        await this.privateRequest('POST', `/futures/usdt/positions/${contract}/leverage`, {}, body);
       }
       
       logger.info(`[GATEIO] ✅ Leverage ${leverage}x set for ${symbol}`);
@@ -187,32 +332,27 @@ class GateIOService {
    */
   async openMarketOrder(symbol, side, quantity, direction = null) {
     try {
-      this.initializeClient();
-      
       logger.info(`[GATEIO] Opening ${side} market order: ${quantity} ${symbol}...`);
       
       const contract = this.formatSymbol(symbol);
       const size = side === 'Buy' ? Math.abs(quantity) : -Math.abs(quantity);
       
-      const futuresOrder = new GateApi.FuturesOrder();
-      futuresOrder.contract = contract;
-      futuresOrder.size = size;
-      futuresOrder.price = '0';
-      futuresOrder.tif = 'ioc';
-      futuresOrder.text = `t-${Date.now()}`;
+      const order = {
+        contract: contract,
+        size: size,
+        price: '0',
+        tif: 'ioc',
+        text: `t-${Date.now()}`
+      };
       
-      const response = await this.client.createFuturesOrder('usdt', futuresOrder);
+      const response = await this.privateRequest('POST', '/futures/usdt/orders', {}, order);
       
-      if (!response || !response.body) {
-        throw new Error('Failed to open order: Invalid response');
-      }
-
-      const orderId = response.body.id?.toString() || '';
+      const orderId = response.id?.toString() || '';
       logger.info(`[GATEIO] ✅ Market order opened: Order ID ${orderId}`);
       
       return {
         orderId: orderId,
-        orderLinkId: response.body.text,
+        orderLinkId: response.text,
         symbol: symbol,
         side: side,
         quantity: Math.abs(quantity)
@@ -228,28 +368,23 @@ class GateIOService {
    */
   async setTakeProfitLimit(symbol, side, price, quantity, direction) {
     try {
-      this.initializeClient();
-      
       logger.info(`[GATEIO] Setting Take Profit limit order @ ${price} for ${symbol}...`);
       
       const contract = this.formatSymbol(symbol);
       const closeSize = direction === 'LONG' ? -Math.abs(quantity) : Math.abs(quantity);
       
-      const futuresOrder = new GateApi.FuturesOrder();
-      futuresOrder.contract = contract;
-      futuresOrder.size = closeSize;
-      futuresOrder.price = price.toString();
-      futuresOrder.tif = 'gtc';
-      futuresOrder.reduce_only = true;
-      futuresOrder.text = `tp-${Date.now()}`;
+      const order = {
+        contract: contract,
+        size: closeSize,
+        price: price.toString(),
+        tif: 'gtc',
+        reduce_only: true,
+        text: `tp-${Date.now()}`
+      };
       
-      const response = await this.client.createFuturesOrder('usdt', futuresOrder);
+      const response = await this.privateRequest('POST', '/futures/usdt/orders', {}, order);
       
-      if (!response || !response.body) {
-        throw new Error('Failed to set Take Profit: Invalid response');
-      }
-
-      const orderId = response.body.id?.toString() || 'TP_LIMIT';
+      const orderId = response.id?.toString() || 'TP_LIMIT';
       logger.info(`[GATEIO] ✅ Take Profit limit order set: Order ID ${orderId}`);
       
       return {
@@ -267,35 +402,31 @@ class GateIOService {
    */
   async setStopLossLimit(symbol, side, price, quantity, direction) {
     try {
-      this.initializeClient();
-      
       logger.info(`[GATEIO] Setting Stop Loss price-triggered order @ ${price} for ${symbol}...`);
       
       const contract = this.formatSymbol(symbol);
       const closeSize = direction === 'LONG' ? -Math.abs(quantity) : Math.abs(quantity);
       
-      const priceOrder = new GateApi.FuturesPriceTriggeredOrder();
-      priceOrder.initial = new GateApi.FuturesInitialOrder();
-      priceOrder.initial.contract = contract;
-      priceOrder.initial.size = closeSize;
-      priceOrder.initial.price = price.toString();
-      priceOrder.initial.tif = 'gtc';
-      priceOrder.initial.reduce_only = true;
-      priceOrder.initial.text = `sl-${Date.now()}`;
+      const priceOrder = {
+        initial: {
+          contract: contract,
+          size: closeSize,
+          price: price.toString(),
+          tif: 'gtc',
+          reduce_only: true,
+          text: `sl-${Date.now()}`
+        },
+        trigger: {
+          strategy_type: 0,
+          price_type: 1,
+          price: price.toString(),
+          rule: direction === 'LONG' ? 2 : 1
+        }
+      };
       
-      priceOrder.trigger = new GateApi.FuturesPriceTrigger();
-      priceOrder.trigger.strategy_type = 0;
-      priceOrder.trigger.price_type = 1;
-      priceOrder.trigger.price = price.toString();
-      priceOrder.trigger.rule = direction === 'LONG' ? 2 : 1;
+      const response = await this.privateRequest('POST', '/futures/usdt/price_orders', {}, priceOrder);
       
-      const response = await this.client.createPriceTriggeredOrder('usdt', priceOrder);
-      
-      if (!response || !response.body) {
-        throw new Error('Failed to set Stop Loss: Invalid response');
-      }
-
-      const orderId = response.body.id?.toString() || 'SL_TRIGGERED';
+      const orderId = response.id?.toString() || 'SL_TRIGGERED';
       logger.info(`[GATEIO] ✅ Stop Loss price-triggered order set: Order ID ${orderId}`);
       
       return {
@@ -313,20 +444,10 @@ class GateIOService {
    */
   async getOpenPositions(symbol = null) {
     try {
-      this.initializeClient();
+      const queryParams = symbol ? { contract: this.formatSymbol(symbol) } : {};
+      const positions = await this.privateRequest('GET', '/futures/usdt/positions', queryParams);
       
-      const opts = {};
-      if (symbol) {
-        opts.contract = this.formatSymbol(symbol);
-      }
-      
-      const response = await this.client.listPositions('usdt', opts);
-      
-      if (!response || !response.body) {
-        throw new Error('Failed to get positions: Invalid response');
-      }
-
-      const positions = response.body
+      return positions
         .filter(pos => parseFloat(pos.size || '0') !== 0)
         .map(pos => {
           const size = parseFloat(pos.size || '0');
@@ -344,8 +465,6 @@ class GateIOService {
             mode: pos.mode || 'single'
           };
         });
-
-      return positions;
     } catch (error) {
       logger.error(`[GATEIO] Error getting open positions: ${error.message}`);
       throw error;
@@ -365,20 +484,14 @@ class GateIOService {
    */
   async getTradeHistory(symbol = null, limit = 50) {
     try {
-      this.initializeClient();
-      
-      const opts = { limit: limit };
+      const queryParams = { limit: limit };
       if (symbol) {
-        opts.contract = this.formatSymbol(symbol);
+        queryParams.contract = this.formatSymbol(symbol);
       }
 
-      const response = await this.client.listMyTrades('usdt', opts);
+      const trades = await this.privateRequest('GET', '/futures/usdt/my_trades', queryParams);
 
-      if (!response || !response.body) {
-        throw new Error('Failed to get trade history: Invalid response');
-      }
-
-      return response.body.map(trade => ({
+      return trades.map(trade => ({
         id: trade.id,
         contract: trade.contract,
         symbol: this.unformatSymbol(trade.contract),
