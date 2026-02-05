@@ -27,7 +27,6 @@ class GateIOService {
    */
   formatSymbol(symbol) {
     if (!symbol) return '';
-    // BTCUSDT -> BTC_USDT
     return symbol.replace('USDT', '_USDT');
   }
 
@@ -36,18 +35,7 @@ class GateIOService {
    */
   unformatSymbol(symbol) {
     if (!symbol) return '';
-    // BTC_USDT -> BTCUSDT
     return symbol.replace('_USDT', 'USDT');
-  }
-
-  /**
-   * Визначає position mode (long/short) для dual_mode
-   */
-  getPositionMode(direction) {
-    if (config.gateio.positionMode === 'dual_mode') {
-      return direction === 'LONG' ? 'long' : 'short';
-    }
-    return undefined; // single_mode не потребує цього параметра
   }
 
   /**
@@ -59,7 +47,6 @@ class GateIOService {
       
       this.initializeClient();
       
-      // Перевіряємо підключення через запит балансу
       const response = await this.client.listFuturesAccounts('usdt');
       
       if (response && response.body) {
@@ -72,6 +59,9 @@ class GateIOService {
       }
     } catch (error) {
       logger.error(`[GATEIO] Connection failed: ${error.message}`);
+      if (error.response && error.response.body) {
+        logger.error(`[GATEIO] Response: ${JSON.stringify(error.response.body)}`);
+      }
       this.isConnected = false;
       throw error;
     }
@@ -117,24 +107,18 @@ class GateIOService {
       }
 
       const contractInfo = response.body;
-      
-      // Визначаємо precision з order_size_min
       const orderSizeMin = parseFloat(contractInfo.order_size_min || '1');
-      let tickSize = orderSizeMin;
-      
-      // Визначаємо price precision
       const orderPriceRound = parseFloat(contractInfo.order_price_round || '0.01');
       const pricePrecision = Math.abs(Math.floor(Math.log10(orderPriceRound)));
 
       return {
         symbol: this.unformatSymbol(contractInfo.name),
         contract: contractInfo.name,
-        tickSize: tickSize,
+        tickSize: orderSizeMin,
         minQty: parseFloat(contractInfo.order_size_min || '1'),
         maxQty: parseFloat(contractInfo.order_size_max || '1000000'),
         pricePrecision: pricePrecision,
-        status: contractInfo.in_delisting ? 'Delisting' : 'Trading',
-        leverage: contractInfo.leverage_max || '100'
+        status: contractInfo.in_delisting ? 'Delisting' : 'Trading'
       };
     } catch (error) {
       logger.error(`[GATEIO] Error getting symbol info for ${symbol}: ${error.message}`);
@@ -179,27 +163,20 @@ class GateIOService {
       
       const contract = this.formatSymbol(symbol);
       
-      // Gate.io потребує окремих викликів для long і short в dual_mode
       if (config.gateio.positionMode === 'dual_mode') {
-        // Встановлюємо для LONG
         await this.client.updatePositionLeverage('usdt', contract, leverage.toString(), { mode: 'long' });
-        // Встановлюємо для SHORT
         await this.client.updatePositionLeverage('usdt', contract, leverage.toString(), { mode: 'short' });
       } else {
-        // single_mode
         await this.client.updatePositionLeverage('usdt', contract, leverage.toString());
       }
       
       logger.info(`[GATEIO] ✅ Leverage ${leverage}x set for ${symbol}`);
       return true;
     } catch (error) {
-      // Якщо плече вже встановлене - це OK
-      if (error.message?.includes('leverage not modified') || 
-          error.message?.includes('same leverage')) {
+      if (error.message?.includes('leverage not modified')) {
         logger.info(`[GATEIO] ✅ Leverage already ${leverage}x for ${symbol}`);
         return true;
       }
-      
       logger.error(`[GATEIO] Error setting leverage: ${error.message}`);
       throw error;
     }
@@ -215,25 +192,16 @@ class GateIOService {
       logger.info(`[GATEIO] Opening ${side} market order: ${quantity} ${symbol}...`);
       
       const contract = this.formatSymbol(symbol);
-      
-      // Визначаємо size (додатне для Buy, від'ємне для Sell)
       const size = side === 'Buy' ? Math.abs(quantity) : -Math.abs(quantity);
       
-      const order = new GateApi.FuturesOrder();
-      order.contract = contract;
-      order.size = size;
-      order.price = '0'; // '0' означає market price
-      order.tif = 'ioc'; // immediate-or-cancel
+      const futuresOrder = new GateApi.FuturesOrder();
+      futuresOrder.contract = contract;
+      futuresOrder.size = size;
+      futuresOrder.price = '0';
+      futuresOrder.tif = 'ioc';
+      futuresOrder.text = `t-${Date.now()}`;
       
-      // Додаємо text для ідентифікації
-      order.text = `t-${Date.now()}`;
-      
-      // Для dual_mode вказуємо режим
-      if (config.gateio.positionMode === 'dual_mode' && direction) {
-        order.auto_size = direction === 'LONG' ? 'close_short' : 'close_long';
-      }
-      
-      const response = await this.client.createFuturesOrder('usdt', order);
+      const response = await this.client.createFuturesOrder('usdt', futuresOrder);
       
       if (!response || !response.body) {
         throw new Error('Failed to open order: Invalid response');
@@ -256,7 +224,7 @@ class GateIOService {
   }
 
   /**
-   * Встановлює Take Profit через Limit ордер (0.02% комісія)
+   * Встановлює Take Profit через Limit ордер
    */
   async setTakeProfitLimit(symbol, side, price, quantity, direction) {
     try {
@@ -265,26 +233,17 @@ class GateIOService {
       logger.info(`[GATEIO] Setting Take Profit limit order @ ${price} for ${symbol}...`);
       
       const contract = this.formatSymbol(symbol);
-      
-      // Визначаємо розмір для закриття позиції
-      // Для LONG позиції - продаємо (негативний size)
-      // Для SHORT позиції - купуємо (позитивний size)
       const closeSize = direction === 'LONG' ? -Math.abs(quantity) : Math.abs(quantity);
       
-      const order = new GateApi.FuturesOrder();
-      order.contract = contract;
-      order.size = closeSize;
-      order.price = price.toString();
-      order.tif = 'gtc'; // good-til-cancelled
-      order.reduce_only = true; // ОБОВ'ЯЗКОВО для TP/SL
-      order.text = `tp-${Date.now()}`;
+      const futuresOrder = new GateApi.FuturesOrder();
+      futuresOrder.contract = contract;
+      futuresOrder.size = closeSize;
+      futuresOrder.price = price.toString();
+      futuresOrder.tif = 'gtc';
+      futuresOrder.reduce_only = true;
+      futuresOrder.text = `tp-${Date.now()}`;
       
-      // Для dual_mode вказуємо що закриваємо
-      if (config.gateio.positionMode === 'dual_mode') {
-        order.auto_size = direction === 'LONG' ? 'close_long' : 'close_short';
-      }
-      
-      const response = await this.client.createFuturesOrder('usdt', order);
+      const response = await this.client.createFuturesOrder('usdt', futuresOrder);
       
       if (!response || !response.body) {
         throw new Error('Failed to set Take Profit: Invalid response');
@@ -304,7 +263,7 @@ class GateIOService {
   }
 
   /**
-   * Встановлює Stop Loss через Price-Triggered ордер (0.02% комісія при виконанні як limit)
+   * Встановлює Stop Loss через Price-Triggered ордер
    */
   async setStopLossLimit(symbol, side, price, quantity, direction) {
     try {
@@ -313,35 +272,22 @@ class GateIOService {
       logger.info(`[GATEIO] Setting Stop Loss price-triggered order @ ${price} for ${symbol}...`);
       
       const contract = this.formatSymbol(symbol);
-      
-      // Визначаємо trigger price та order price
-      const triggerPrice = price;
-      
-      // Для LONG: тригер нижче входу, виконуємо продаж
-      // Для SHORT: тригер вище входу, виконуємо покупку
       const closeSize = direction === 'LONG' ? -Math.abs(quantity) : Math.abs(quantity);
       
-      // Використовуємо price-triggered orders API
       const priceOrder = new GateApi.FuturesPriceTriggeredOrder();
       priceOrder.initial = new GateApi.FuturesInitialOrder();
       priceOrder.initial.contract = contract;
       priceOrder.initial.size = closeSize;
-      priceOrder.initial.price = price.toString(); // Limit price при виконанні
+      priceOrder.initial.price = price.toString();
       priceOrder.initial.tif = 'gtc';
       priceOrder.initial.reduce_only = true;
       priceOrder.initial.text = `sl-${Date.now()}`;
       
-      // Trigger налаштування
       priceOrder.trigger = new GateApi.FuturesPriceTrigger();
-      priceOrder.trigger.strategy_type = 0; // 0 = price trigger
-      priceOrder.trigger.price_type = 1; // 1 = mark price (краще для SL)
-      priceOrder.trigger.price = triggerPrice.toString();
-      priceOrder.trigger.rule = direction === 'LONG' ? 2 : 1; // 1 = >=, 2 = <=
-      
-      // Для dual_mode
-      if (config.gateio.positionMode === 'dual_mode') {
-        priceOrder.initial.auto_size = direction === 'LONG' ? 'close_long' : 'close_short';
-      }
+      priceOrder.trigger.strategy_type = 0;
+      priceOrder.trigger.price_type = 1;
+      priceOrder.trigger.price = price.toString();
+      priceOrder.trigger.rule = direction === 'LONG' ? 2 : 1;
       
       const response = await this.client.createPriceTriggeredOrder('usdt', priceOrder);
       
@@ -369,12 +315,12 @@ class GateIOService {
     try {
       this.initializeClient();
       
-      const params = {};
+      const opts = {};
       if (symbol) {
-        params.contract = this.formatSymbol(symbol);
+        opts.contract = this.formatSymbol(symbol);
       }
       
-      const response = await this.client.listPositions('usdt', params);
+      const response = await this.client.listPositions('usdt', opts);
       
       if (!response || !response.body) {
         throw new Error('Failed to get positions: Invalid response');
@@ -422,7 +368,6 @@ class GateIOService {
       this.initializeClient();
       
       const opts = { limit: limit };
-      
       if (symbol) {
         opts.contract = this.formatSymbol(symbol);
       }
@@ -449,46 +394,7 @@ class GateIOService {
       throw error;
     }
   }
-
-  /**
-   * Скасовує ордер
-   */
-  async cancelOrder(orderId, symbol) {
-    try {
-      this.initializeClient();
-      
-      logger.info(`[GATEIO] Cancelling order ${orderId} for ${symbol}...`);
-      
-      await this.client.cancelFuturesOrder('usdt', orderId);
-      
-      logger.info(`[GATEIO] ✅ Order ${orderId} cancelled`);
-      return true;
-    } catch (error) {
-      logger.error(`[GATEIO] Error cancelling order: ${error.message}`);
-      throw error;
-    }
-  }
-
-  /**
-   * Скасовує price-triggered ордер (для SL)
-   */
-  async cancelPriceTriggeredOrder(orderId) {
-    try {
-      this.initializeClient();
-      
-      logger.info(`[GATEIO] Cancelling price-triggered order ${orderId}...`);
-      
-      await this.client.cancelPriceTriggeredOrder('usdt', orderId);
-      
-      logger.info(`[GATEIO] ✅ Price-triggered order ${orderId} cancelled`);
-      return true;
-    } catch (error) {
-      logger.error(`[GATEIO] Error cancelling price-triggered order: ${error.message}`);
-      throw error;
-    }
-  }
 }
 
-// Експортуємо singleton
 const gateioService = new GateIOService();
 export default gateioService;
