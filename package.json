@@ -1,0 +1,30 @@
+{
+  "name": "gateio-futures-trading-bot",
+  "version": "1.0.0",
+  "description": "Automated trading bot for Gate.io Futures that reads signals from Telegram",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js",
+    "test": "node index.js",
+    "balance": "node scripts/check-balance.js",
+    "positions": "node scripts/check-positions.js"
+  },
+  "keywords": [
+    "gateio",
+    "gate.io",
+    "trading",
+    "bot",
+    "futures",
+    "telegram"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "gate-api": "^6.45.0",
+    "node-telegram-bot-api": "^0.66.0",
+    "dotenv": "^16.4.5",
+    "axios": "^1.7.7",
+    "winston": "^3.15.0"
+  }
+}
