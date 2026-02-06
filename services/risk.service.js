@@ -1,13 +1,13 @@
 import { config } from '../config/settings.js';
-import { roundQuantity, roundPrice, isValidNumber } from '../utils/helpers.js';
+import { roundPrice, isValidNumber } from '../utils/helpers.js';
 import logger from '../utils/logger.js';
 
 /**
- * Розраховує параметри позиції на основі risk management правил
- * @param {number} balance - баланс USDT на Futures акаунті
+ * Розраховує параметри позиції для Gate.io Futures згідно правильної логіки
+ * @param {number} balance - available balance USDT на Futures акаунті
  * @param {number} entryPrice - поточна ціна входу
  * @param {string} direction - 'LONG' або 'SHORT'
- * @param {Object} symbolInfo - інформація про символ (tickSize, minQty, maxQty, pricePrecision)
+ * @param {Object} symbolInfo - інформація про символ (minQty, maxQty, pricePrecision)
  * @returns {Object} параметри позиції
  */
 export function calculatePositionParameters(balance, entryPrice, direction, symbolInfo = {}) {
@@ -25,126 +25,104 @@ export function calculatePositionParameters(balance, entryPrice, direction, symb
       throw new Error(`Invalid direction: ${direction}. Must be LONG or SHORT`);
     }
 
-    // 🔹 SAFETY BUFFER: Використовуємо 99% балансу для розрахунків
-    const usableBalance = balance * 0.99;
-    logger.info(`[RISK] Balance: ${balance} USDT, Usable (99%): ${usableBalance.toFixed(6)} USDT`);
-
-    // 1. Розрахувати ризик в USDT (від usableBalance)
-    const riskAmount = usableBalance * (config.risk.percentage / 100);
-    logger.info(`[RISK] Risk: ${config.risk.percentage}% = ${riskAmount.toFixed(6)} USDT`);
-
-    // 2. Розрахувати Stop Loss ціну
-    const stopLossPrice = direction === 'LONG'
-      ? entryPrice * (1 - config.risk.stopLossPercent / 100)  // -0.3%
-      : entryPrice * (1 + config.risk.stopLossPercent / 100); // +0.3%
-
-    // 3. Розрахувати відстань до SL
-    const stopLossDistance = Math.abs(entryPrice - stopLossPrice);
-    
-    if (stopLossDistance <= 0) {
-      throw new Error('Stop loss distance is zero or negative');
-    }
-
-    // 4. Розрахувати розмір позиції (в USDT)
-    let positionSize = (riskAmount / stopLossDistance) * entryPrice;
-
-    // 5. З урахуванням плеча
     const leverage = config.risk.leverage;
-    let requiredMargin = positionSize / leverage;
-
-    // 🔹 ПЕРЕВІРКА: якщо margin перевищує usableBalance
-    if (requiredMargin > usableBalance) {
-      logger.warn(`[RISK] Required margin (${requiredMargin.toFixed(6)}) > usable balance (${usableBalance.toFixed(6)})`);
-      // Перерахувати з максимально доступним балансом
-      positionSize = usableBalance * leverage;
-      requiredMargin = usableBalance;
-    }
-
-    // 6. Розрахувати кількість контрактів
-    let quantity = positionSize / entryPrice;
-
-    // 7. Розрахувати Take Profit ціну
-    const takeProfitPrice = direction === 'LONG'
-      ? entryPrice * (1 + config.risk.takeProfitPercent / 100)  // +0.5%
-      : entryPrice * (1 - config.risk.takeProfitPercent / 100); // -0.5%
-
-    // 8. Округлити значення згідно з вимогами біржі
-    const pricePrecision = symbolInfo.pricePrecision !== undefined ? symbolInfo.pricePrecision : 4;
+    const riskPercent = config.risk.percentage / 100; // Конвертуємо в decimal (10% → 0.10)
     
-    // 🔹 ВАЖЛИВО: Gate.io futures - size тільки INTEGER (enable_decimal=false)
-    const minQty = Math.max(symbolInfo.minQty || 1, 1); // Мінімум 1 контракт
+    // КРОК 1: Safety buffer (99%)
+    const usableBalance = balance * 0.99;
+    
+    // КРОК 2: marginLimit = usableBalance * riskPercent
+    // Це МАКСИМАЛЬНА маржа яку ми хочемо використати
+    const marginLimit = usableBalance * riskPercent;
+    
+    // КРОК 3: notional = marginLimit * leverage
+    // Це розмір позиції в USDT
+    const notional = marginLimit * leverage;
+    
+    // КРОК 4: size (кількість контрактів) = floor(notional / entryPrice)
+    // Gate.io: 1 contract = 1 USD worth of asset
+    // Для USDT-settled futures: size = notional / entry_price
+    let size = Math.floor(notional / entryPrice);
+    
+    // КРОК 5: Перевірка мінімальних обмежень
+    const minQty = Math.max(symbolInfo.minQty || 1, 1);
     const maxQty = symbolInfo.maxQty || Infinity;
-
-    // Округлюємо quantity до INTEGER (вниз)
-    quantity = Math.floor(quantity);
-
+    
+    if (size < minQty) {
+      throw new Error(
+        `Insufficient balance for minimum order size. ` +
+        `Calculated: ${size} contracts, Minimum: ${minQty} contracts`
+      );
+    }
+    
+    if (size > maxQty) {
+      logger.warn(`[RISK] Calculated size (${size}) > maximum (${maxQty}). Using maximum.`);
+      size = maxQty;
+    }
+    
+    // КРОК 6: Перерахувати фактичну маржу з фінальним size
+    let requiredMargin = (size * entryPrice) / leverage;
+    
+    // КРОК 7: Автокорекція якщо requiredMargin > usableBalance
+    while (requiredMargin > usableBalance && size > minQty) {
+      logger.warn(`[RISK] Margin ${requiredMargin.toFixed(6)} > usable ${usableBalance.toFixed(6)}, reducing size: ${size} -> ${size - 1}`);
+      size -= 1;
+      requiredMargin = (size * entryPrice) / leverage;
+    }
+    
+    // Фінальна перевірка
+    if (requiredMargin > usableBalance) {
+      throw new Error(
+        `Insufficient balance even with adjusted size. ` +
+        `Required: ${requiredMargin.toFixed(6)} USDT, ` +
+        `Usable: ${usableBalance.toFixed(6)} USDT (99% of ${balance})`
+      );
+    }
+    
+    // КРОК 8: Розрахувати TP/SL ціни
+    const stopLossPrice = direction === 'LONG'
+      ? entryPrice * (1 - config.risk.stopLossPercent / 100)
+      : entryPrice * (1 + config.risk.stopLossPercent / 100);
+    
+    const takeProfitPrice = direction === 'LONG'
+      ? entryPrice * (1 + config.risk.takeProfitPercent / 100)
+      : entryPrice * (1 - config.risk.takeProfitPercent / 100);
+    
+    // КРОК 9: Округлити ціни
+    const pricePrecision = symbolInfo.pricePrecision !== undefined ? symbolInfo.pricePrecision : 4;
     const roundedEntryPrice = roundPrice(entryPrice, pricePrecision);
     const roundedStopLoss = roundPrice(stopLossPrice, pricePrecision);
     const roundedTakeProfit = roundPrice(takeProfitPrice, pricePrecision);
-
-    // Перевірка мінімальних обмежень
-    if (quantity < minQty) {
-      logger.warn(`[RISK] Calculated quantity (${quantity}) < minimum (${minQty}). Using minimum.`);
-      quantity = minQty;
-    }
-
-    // Перевірка максимальних обмежень
-    if (quantity > maxQty) {
-      logger.warn(`[RISK] Calculated quantity (${quantity}) > maximum (${maxQty}). Using maximum.`);
-      quantity = maxQty;
-    }
-
-    // 🔹 АВТОКОРЕКЦІЯ: якщо requiredMargin > usableBalance, зменшуємо size по 1 контракту
-    let finalRequiredMargin = (quantity * entryPrice) / leverage;
     
-    while (finalRequiredMargin > usableBalance && quantity > minQty) {
-      logger.warn(`[RISK] Margin ${finalRequiredMargin.toFixed(6)} > usable ${usableBalance.toFixed(6)}, reducing size: ${quantity} -> ${quantity - 1}`);
-      quantity -= 1;
-      finalRequiredMargin = (quantity * entryPrice) / leverage;
-    }
-
-    // 🔹 ФІНАЛЬНА ПЕРЕВІРКА: дозволяємо мікро-різницю до 0.1 USDT
-    const marginDifference = finalRequiredMargin - usableBalance;
+    // Фінальний notional з реальним size
+    const finalNotional = size * entryPrice;
     
-    if (marginDifference > 0.1) {
-      // Якщо різниця > 0.1 USDT і size вже мінімальний
-      if (quantity <= minQty) {
-        throw new Error(
-          `Insufficient balance even with minimum size. ` +
-          `Required: ${finalRequiredMargin.toFixed(6)} USDT, ` +
-          `Usable: ${usableBalance.toFixed(6)} USDT (99% of ${balance}), ` +
-          `Difference: ${marginDifference.toFixed(6)} USDT`
-        );
-      }
-    } else if (marginDifference > 0 && marginDifference <= 0.1) {
-      // Мікро-різниця < 0.1 USDT - зменшуємо size на 1 для безпеки
-      logger.info(`[RISK] Micro-difference ${marginDifference.toFixed(6)} USDT detected, reducing size for safety`);
-      if (quantity > minQty) {
-        quantity -= 1;
-        finalRequiredMargin = (quantity * entryPrice) / leverage;
-      }
-    }
-
-    // Перерахувати positionSize з фінальним quantity
-    const finalPositionSize = quantity * entryPrice;
-
+    // Debug лог перед відкриттям
+    logger.info(`[RISK] ━━━ POSITION CALCULATION ━━━`);
+    logger.info(`  Available Balance: ${balance.toFixed(6)} USDT`);
+    logger.info(`  Usable Balance (99%): ${usableBalance.toFixed(6)} USDT`);
+    logger.info(`  Risk Percent: ${(riskPercent * 100).toFixed(2)}%`);
+    logger.info(`  Margin Limit: ${marginLimit.toFixed(6)} USDT`);
+    logger.info(`  Leverage: ${leverage}x`);
+    logger.info(`  Notional (target): ${notional.toFixed(6)} USDT`);
+    logger.info(`  Entry Price: ${entryPrice}`);
+    logger.info(`  Size: ${size} contracts`);
+    logger.info(`  Notional (actual): ${finalNotional.toFixed(6)} USDT`);
+    logger.info(`  Required Margin: ${requiredMargin.toFixed(6)} USDT`);
+    logger.info(`  Margin %: ${((requiredMargin/balance)*100).toFixed(2)}%`);
+    logger.info(`  TP: ${roundedTakeProfit}, SL: ${roundedStopLoss}`);
+    
     const result = {
       entryPrice: roundedEntryPrice,
-      quantity: quantity,  // INTEGER
-      positionSize: finalPositionSize,
+      quantity: size,  // INTEGER (кількість контрактів)
+      positionSize: finalNotional,
       leverage: leverage,
-      requiredMargin: finalRequiredMargin,
+      requiredMargin: requiredMargin,
       stopLoss: roundedStopLoss,
       takeProfit: roundedTakeProfit,
-      riskAmount: riskAmount,
+      riskAmount: marginLimit, // Це наш marginLimit
       direction: direction
     };
-
-    logger.info(
-      `[RISK] ✅ Final position: ${quantity} contracts @ ${roundedEntryPrice}, ` +
-      `Margin: ${finalRequiredMargin.toFixed(6)} USDT (${((finalRequiredMargin/balance)*100).toFixed(2)}%), ` +
-      `TP: ${roundedTakeProfit}, SL: ${roundedStopLoss}`
-    );
 
     return result;
   } catch (error) {
