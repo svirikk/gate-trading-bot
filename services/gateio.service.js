@@ -347,23 +347,16 @@ class GateIOService {
       const contract = this.formatSymbol(symbol);
 
       if (config.gateio.positionMode === 'dual_mode') {
-        // Dual mode: окремо для long і short через інший метод
-        try {
-          // Для dual mode використовуємо інший endpoint
-          await this.privateRequest('POST', `/futures/usdt/dual_mode/positions/${contract}/leverage`, {}, {
-            leverage: leverage.toString()
-          });
-        } catch (error) {
-          // Якщо dual_mode endpoint не працює, пробуємо звичайний
-          logger.warn('[GATEIO] Dual mode endpoint failed, trying regular...');
-          await this.privateRequest('POST', `/futures/usdt/positions/${contract}/leverage`, {}, {
-            leverage: leverage.toString()
-          });
-        }
+        // Dual mode: окремо для long і short
+        await this.privateRequest('POST', `/futures/usdt/positions/${contract}/leverage`, {}, {
+          leverage: leverage.toString(),
+          cross_leverage_limit: '0'
+        });
       } else {
         // Single mode
         await this.privateRequest('POST', `/futures/usdt/positions/${contract}/leverage`, {}, {
-          leverage: leverage.toString()
+          leverage: leverage.toString(),
+          cross_leverage_limit: '0'
         });
       }
 
