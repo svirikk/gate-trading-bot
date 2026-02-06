@@ -5,7 +5,7 @@ import logger from '../utils/logger.js';
 
 class GateIOService {
   constructor() {
-    this.baseURL = 'https://api.gateio.ws/api/v4';
+    this.baseURL = config.gateio.baseURL;
     this.apiKey = config.gateio.apiKey;
     this.apiSecret = config.gateio.apiSecret;
     this.isConnected = false;
@@ -40,6 +40,29 @@ class GateIOService {
     logger.info(`  Signature string: ${signatureString.replace(/\n/g, '\\n')}`);
 
     return signature;
+  }
+
+  /**
+   * Формує query string з параметрів (у правильному порядку та з кодуванням)
+   */
+  buildQueryString(queryParams = {}) {
+    const params = new URLSearchParams();
+
+    Object.keys(queryParams)
+      .sort()
+      .forEach(key => {
+        const value = queryParams[key];
+        if (value === undefined || value === null) return;
+
+        if (Array.isArray(value)) {
+          value.forEach(item => params.append(key, String(item)));
+          return;
+        }
+
+        params.append(key, String(value));
+      });
+
+    return params.toString();
   }
 
   /**
@@ -81,19 +104,15 @@ class GateIOService {
    */
   async privateRequest(method, endpoint, queryParams = {}, body = null) {
     const timestamp = Math.floor(Date.now() / 1000).toString();
+    const normalizedMethod = method.toUpperCase();
     
     // Для підпису використовуємо повний path з /api/v4
     const signaturePath = `/api/v4${endpoint}`;
     
-    const queryString = Object.keys(queryParams).length > 0
-      ? Object.keys(queryParams)
-          .sort()
-          .map(key => `${key}=${queryParams[key]}`)
-          .join('&')
-      : '';
+    const queryString = this.buildQueryString(queryParams);
     
     const bodyString = body ? JSON.stringify(body) : '';
-    const signature = this.generateSignature(method, signaturePath, queryString, bodyString, timestamp);
+    const signature = this.generateSignature(normalizedMethod, signaturePath, queryString, bodyString, timestamp);
 
     const url = `${this.baseURL}${endpoint}${queryString ? '?' + queryString : ''}`;
 
@@ -106,7 +125,7 @@ class GateIOService {
 
     try {
       logger.info(`[GATEIO] PRIVATE REQUEST:`);
-      logger.info(`  Method: ${method}`);
+      logger.info(`  Method: ${normalizedMethod}`);
       logger.info(`  URL: ${url}`);
       logger.info(`  Headers (без секретів):`);
       logger.info(`    KEY: ${this.apiKey.substring(0, 10)}...`);
@@ -115,7 +134,7 @@ class GateIOService {
       logger.info(`  Body: ${bodyString || '(empty)'}`);
 
       const response = await axios({
-        method,
+        method: normalizedMethod,
         url,
         headers,
         data: body || undefined
@@ -140,7 +159,7 @@ class GateIOService {
    */
   formatSymbol(symbol) {
     if (!symbol) return '';
-    return symbol.replace('USDT', '_USDT');
+    return symbol.replace(/USDT$/, '_USDT');
   }
 
   /**
@@ -148,7 +167,7 @@ class GateIOService {
    */
   unformatSymbol(symbol) {
     if (!symbol) return '';
-    return symbol.replace('_USDT', 'USDT');
+    return symbol.replace(/_USDT$/, 'USDT');
   }
 
   /**
