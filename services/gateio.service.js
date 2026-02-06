@@ -410,7 +410,7 @@ class GateIOService {
         size: size,          // INTEGER: додатний для LONG, від'ємний для SHORT
         price: '0',          // "0" для market згідно документації
         tif: 'ioc',          // immediate-or-cancel
-        text: `entry-${Date.now()}`,
+        text: `t-entry-${Date.now()}`,  // ВАЖЛИВО: має починатися з "t-"
         reduce_only: false   // Відкриваємо нову позицію
       };
 
@@ -460,7 +460,7 @@ class GateIOService {
         price: price.toString(),
         tif: 'gtc',
         reduce_only: true,  // ОБОВ'ЯЗКОВО для TP!
-        text: `tp-${Date.now()}`
+        text: `t-tp-${Date.now()}`  // ВАЖЛИВО: має починатися з "t-"
       };
 
       logger.info(`[GATEIO] TP order payload: ${JSON.stringify(order)}`);
@@ -506,7 +506,7 @@ class GateIOService {
           price: price.toString(),
           tif: 'gtc',
           reduce_only: true,  // ОБОВ'ЯЗКОВО!
-          text: `sl-${Date.now()}`
+          text: `t-sl-${Date.now()}`  // ВАЖЛИВО: має починатися з "t-"
         },
         trigger: {
           strategy_type: 0,   // 0 = price trigger
