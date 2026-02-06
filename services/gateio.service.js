@@ -339,6 +339,12 @@ class GateIOService {
 
   /**
    * Встановлює leverage
+   * 
+   * ⚠️ ВАЖЛИВО: leverage передається як QUERY PARAMETER, НЕ в body!
+   * Правильний формат: POST /futures/usdt/positions/{contract}/leverage?leverage=20
+   * 
+   * Згідно офіційної документації Gate.io:
+   * https://www.gate.io/docs/developers/apiv4/en/
    */
   async setLeverage(symbol, leverage) {
     try {
@@ -346,25 +352,24 @@ class GateIOService {
 
       const contract = this.formatSymbol(symbol);
 
+      // ✅ ВИПРАВЛЕНО: leverage як query parameter
+      const queryParams = {
+        leverage: leverage.toString()
+      };
+
       if (config.gateio.positionMode === 'dual_mode') {
         // Dual mode: окремо для long і short через інший метод
         try {
           // Для dual mode використовуємо інший endpoint
-          await this.privateRequest('POST', `/futures/usdt/dual_mode/positions/${contract}/leverage`, {}, {
-            leverage: leverage.toString()
-          });
+          await this.privateRequest('POST', `/futures/usdt/dual_mode/positions/${contract}/leverage`, queryParams);
         } catch (error) {
           // Якщо dual_mode endpoint не працює, пробуємо звичайний
           logger.warn('[GATEIO] Dual mode endpoint failed, trying regular...');
-          await this.privateRequest('POST', `/futures/usdt/positions/${contract}/leverage`, {}, {
-            leverage: leverage.toString()
-          });
+          await this.privateRequest('POST', `/futures/usdt/positions/${contract}/leverage`, queryParams);
         }
       } else {
-        // Single mode
-        await this.privateRequest('POST', `/futures/usdt/positions/${contract}/leverage`, {}, {
-          leverage: leverage.toString()
-        });
+        // Single mode - БЕЗ body, тільки query params
+        await this.privateRequest('POST', `/futures/usdt/positions/${contract}/leverage`, queryParams);
       }
 
       logger.info(`[GATEIO] ✓ Leverage ${leverage}x set`);
