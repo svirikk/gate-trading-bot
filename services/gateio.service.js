@@ -8,6 +8,7 @@ import logger from '../utils/logger.js';
  * Офіційна документація: https://www.gate.io/docs/developers/futures/
  * 
  * ВАЖЛИВО: Підтримка дробових контрактів через X-Gate-Size-Decimal: 1 header
+ * Size має бути NUMBER (не string) для дробових значень
  */
 class GateIOService {
   constructor() {
@@ -70,7 +71,7 @@ class GateIOService {
         headers: {
           'Content-Type': 'application/json',
           'Accept': 'application/json',
-          'X-Gate-Size-Decimal': '1'  // Підтримка дробових розмірів
+          'X-Gate-Size-Decimal': '1'
         }
       });
 
@@ -115,14 +116,13 @@ class GateIOService {
 
     const url = `${this.baseURL}${resourcePath}${queryString ? '?' + queryString : ''}`;
 
-    // ВАЖЛИВО: X-Gate-Size-Decimal: 1 дозволяє дробові контракти
     const headers = {
       'KEY': this.apiKey,
       'Timestamp': timestamp,
       'SIGN': signature,
       'Content-Type': 'application/json',
       'Accept': 'application/json',
-      'X-Gate-Size-Decimal': '1'  // ✅ Підтримка дробових розмірів (0.3 contracts)
+      'X-Gate-Size-Decimal': '1'  // ✅ КРИТИЧНО для дробових контрактів
     };
 
     try {
@@ -335,8 +335,8 @@ class GateIOService {
   /**
    * MARKET ORDER - відкриває позицію
    * 
-   * ВАЖЛИВО: size може бути ДРОБОВИМ завдяки X-Gate-Size-Decimal: 1 header
-   * Приклад: size = 0.216 контрактів (для HYPE з балансом $12)
+   * КРИТИЧНО: size має бути NUMBER (не string) для дробових значень
+   * Приклад: size: 0.215308 (NOT "0.215308")
    */
   async openMarketOrder(symbol, side, quantity, direction) {
     try {
@@ -344,15 +344,15 @@ class GateIOService {
 
       const contract = this.formatSymbol(symbol);
 
-      // ВАЖЛИВО: size може бути FLOAT (дробовий)
+      // КРИТИЧНО: size має бути NUMBER для дробових контрактів
       // Знак визначає напрямок: додатний для LONG, від'ємний для SHORT
       const size = direction === 'LONG'
-        ? Math.abs(quantity)
-        : -Math.abs(quantity);
+        ? parseFloat(Math.abs(quantity).toFixed(6))  // NUMBER, не string
+        : parseFloat(-Math.abs(quantity).toFixed(6));
 
       const order = {
         contract: contract,
-        size: size,          // FLOAT: 0.216 для LONG, -0.216 для SHORT
+        size: size,          // NUMBER: 0.215308 для LONG, -0.215308 для SHORT
         price: '0',          // "0" для market
         tif: 'ioc',          // immediate-or-cancel
         text: `t-entry-${Date.now()}`,
@@ -360,6 +360,7 @@ class GateIOService {
       };
 
       logger.info(`[GATEIO] Order payload: ${JSON.stringify(order)}`);
+      logger.info(`[GATEIO] Size type: ${typeof size}, value: ${size}`);
 
       const response = await this.privateRequest('POST', '/futures/usdt/orders', {}, order);
 
@@ -390,12 +391,12 @@ class GateIOService {
       const contract = this.formatSymbol(symbol);
 
       const closeSize = direction === 'LONG'
-        ? -Math.abs(quantity)
-        : Math.abs(quantity);
+        ? parseFloat(-Math.abs(quantity).toFixed(6))
+        : parseFloat(Math.abs(quantity).toFixed(6));
 
       const order = {
         contract: contract,
-        size: closeSize,  // FLOAT дозволено
+        size: closeSize,  // NUMBER
         price: price.toString(),
         tif: 'gtc',
         reduce_only: true,
@@ -429,13 +430,13 @@ class GateIOService {
       const contract = this.formatSymbol(symbol);
 
       const closeSize = direction === 'LONG'
-        ? -Math.abs(quantity)
-        : Math.abs(quantity);
+        ? parseFloat(-Math.abs(quantity).toFixed(6))
+        : parseFloat(Math.abs(quantity).toFixed(6));
 
       const priceOrder = {
         initial: {
           contract: contract,
-          size: closeSize,  // FLOAT дозволено
+          size: closeSize,  // NUMBER
           price: price.toString(),
           tif: 'gtc',
           reduce_only: true,
