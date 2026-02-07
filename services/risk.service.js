@@ -3,7 +3,11 @@ import { roundPrice, isValidNumber } from '../utils/helpers.js';
 import logger from '../utils/logger.js';
 
 /**
- * Розраховує параметри позиції для Gate.io Futures згідно правильної логіки
+ * Розраховує параметри позиції для Gate.io Futures
+ * 
+ * ВАЖЛИВО: Gate.io підтримує дробові контракти через header X-Gate-Size-Decimal: 1
+ * Це означає що size може бути будь-яким числом, наприклад 0.3 контракту
+ * 
  * @param {number} balance - available balance USDT на Futures акаунті
  * @param {number} entryPrice - поточна ціна входу
  * @param {string} direction - 'LONG' або 'SHORT'
@@ -26,7 +30,7 @@ export function calculatePositionParameters(balance, entryPrice, direction, symb
     }
 
     const leverage = config.risk.leverage;
-    const riskPercent = config.risk.percentage / 100; // Конвертуємо в decimal (10% → 0.10)
+    const riskPercent = config.risk.percentage / 100; // Конвертуємо в decimal (3% → 0.03)
     
     // КРОК 1: Safety buffer (99%)
     const usableBalance = balance * 0.99;
@@ -39,47 +43,38 @@ export function calculatePositionParameters(balance, entryPrice, direction, symb
     // Це розмір позиції в USDT
     const notional = marginLimit * leverage;
     
-    // КРОК 4: size (кількість контрактів) = floor(notional / entryPrice)
-    // Gate.io: 1 contract = 1 USD worth of asset
-    // Для USDT-settled futures: size = notional / entry_price
-    let size = Math.floor(notional / entryPrice);
+    // КРОК 4: size (кількість контрактів) = notional / entryPrice
+    // Gate.io підтримує дробові контракти через X-Gate-Size-Decimal: 1 header
+    // Тому НЕ використовуємо Math.floor() - дозволяємо дробові значення
+    // Приклад: для HYPE ($33.29) з ризиком 3%:
+    // - notional = 7.2 USDT
+    // - size = 7.2 / 33.29 = 0.216 контрактів ✅ (дозволено!)
+    let size = notional / entryPrice;
     
-    // КРОК 5: Перевірка мінімальних обмежень
-    const minQty = Math.max(symbolInfo.minQty || 1, 1);
+    // КРОК 5: Округлення до розумної точності (6 знаків після коми)
+    // Це для уникнення проблем з float precision
+    size = Math.round(size * 1000000) / 1000000;
+    
+    // КРОК 6: Перевірка максимуму (якщо заданий)
     const maxQty = symbolInfo.maxQty || Infinity;
-    
-    if (size < minQty) {
-      throw new Error(
-        `Insufficient balance for minimum order size. ` +
-        `Calculated: ${size} contracts, Minimum: ${minQty} contracts`
-      );
-    }
-    
     if (size > maxQty) {
       logger.warn(`[RISK] Calculated size (${size}) > maximum (${maxQty}). Using maximum.`);
       size = maxQty;
     }
     
-    // КРОК 6: Перерахувати фактичну маржу з фінальним size
+    // КРОК 7: Перерахувати фактичну маржу з фінальним size
     let requiredMargin = (size * entryPrice) / leverage;
     
-    // КРОК 7: Автокорекція якщо requiredMargin > usableBalance
-    while (requiredMargin > usableBalance && size > minQty) {
-      logger.warn(`[RISK] Margin ${requiredMargin.toFixed(6)} > usable ${usableBalance.toFixed(6)}, reducing size: ${size} -> ${size - 1}`);
-      size -= 1;
-      requiredMargin = (size * entryPrice) / leverage;
-    }
-    
-    // Фінальна перевірка
+    // КРОК 8: Фінальна перевірка балансу
     if (requiredMargin > usableBalance) {
       throw new Error(
-        `Insufficient balance even with adjusted size. ` +
+        `Insufficient balance. ` +
         `Required: ${requiredMargin.toFixed(6)} USDT, ` +
-        `Usable: ${usableBalance.toFixed(6)} USDT (99% of ${balance})`
+        `Usable: ${usableBalance.toFixed(6)} USDT (99% of ${balance.toFixed(2)} USDT)`
       );
     }
     
-    // КРОК 8: Розрахувати TP/SL ціни
+    // КРОК 9: Розрахувати TP/SL ціни
     const stopLossPrice = direction === 'LONG'
       ? entryPrice * (1 - config.risk.stopLossPercent / 100)
       : entryPrice * (1 + config.risk.stopLossPercent / 100);
@@ -88,7 +83,7 @@ export function calculatePositionParameters(balance, entryPrice, direction, symb
       ? entryPrice * (1 + config.risk.takeProfitPercent / 100)
       : entryPrice * (1 - config.risk.takeProfitPercent / 100);
     
-    // КРОК 9: Округлити ціни
+    // КРОК 10: Округлити ціни
     const pricePrecision = symbolInfo.pricePrecision !== undefined ? symbolInfo.pricePrecision : 4;
     const roundedEntryPrice = roundPrice(entryPrice, pricePrecision);
     const roundedStopLoss = roundPrice(stopLossPrice, pricePrecision);
@@ -99,14 +94,15 @@ export function calculatePositionParameters(balance, entryPrice, direction, symb
     
     // Debug лог перед відкриттям
     logger.info(`[RISK] ━━━ POSITION CALCULATION ━━━`);
+    logger.info(`  Symbol: ${symbolInfo.symbol || 'UNKNOWN'}`);
+    logger.info(`  Entry Price: $${entryPrice}`);
     logger.info(`  Available Balance: ${balance.toFixed(6)} USDT`);
     logger.info(`  Usable Balance (99%): ${usableBalance.toFixed(6)} USDT`);
     logger.info(`  Risk Percent: ${(riskPercent * 100).toFixed(2)}%`);
     logger.info(`  Margin Limit: ${marginLimit.toFixed(6)} USDT`);
     logger.info(`  Leverage: ${leverage}x`);
     logger.info(`  Notional (target): ${notional.toFixed(6)} USDT`);
-    logger.info(`  Entry Price: ${entryPrice}`);
-    logger.info(`  Size: ${size} contracts`);
+    logger.info(`  Size: ${size} contracts (fractional allowed)`);
     logger.info(`  Notional (actual): ${finalNotional.toFixed(6)} USDT`);
     logger.info(`  Required Margin: ${requiredMargin.toFixed(6)} USDT`);
     logger.info(`  Margin %: ${((requiredMargin/balance)*100).toFixed(2)}%`);
@@ -114,14 +110,15 @@ export function calculatePositionParameters(balance, entryPrice, direction, symb
     
     const result = {
       entryPrice: roundedEntryPrice,
-      quantity: size,  // INTEGER (кількість контрактів)
+      quantity: size,  // FLOAT з дробовою частиною (наприклад 0.216)
       positionSize: finalNotional,
       leverage: leverage,
       requiredMargin: requiredMargin,
       stopLoss: roundedStopLoss,
       takeProfit: roundedTakeProfit,
-      riskAmount: marginLimit, // Це наш marginLimit
-      direction: direction
+      riskAmount: marginLimit,
+      direction: direction,
+      symbol: symbolInfo.symbol || 'UNKNOWN'
     };
 
     return result;

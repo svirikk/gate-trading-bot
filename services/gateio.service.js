@@ -6,6 +6,8 @@ import logger from '../utils/logger.js';
 /**
  * Gate.io Futures API v4 Service
  * Офіційна документація: https://www.gate.io/docs/developers/futures/
+ * 
+ * ВАЖЛИВО: Підтримка дробових контрактів через X-Gate-Size-Decimal: 1 header
  */
 class GateIOService {
   constructor() {
@@ -18,19 +20,13 @@ class GateIOService {
 
   /**
    * Генерує HMAC-SHA512 підпис згідно Gate.io API v4 документації
-   * 
-   * Signature formula:
-   * prehash = METHOD + "\n" + RESOURCE_PATH + "\n" + QUERY_STRING + "\n" + BODY_HASH + "\n" + TIMESTAMP
-   * SIGN = HMAC_SHA512(API_SECRET, prehash)
    */
   generateSignature(method, resourcePath, queryString, bodyString, timestamp) {
-    // 1. Хешуємо body з SHA512
     const bodyHash = crypto
       .createHash('sha512')
       .update(bodyString)
       .digest('hex');
 
-    // 2. Формуємо prehash string
     const prehashParts = [
       method,
       resourcePath,
@@ -40,7 +36,6 @@ class GateIOService {
     ];
     const prehashString = prehashParts.join('\n');
 
-    // 3. HMAC-SHA512 підпис
     const signature = crypto
       .createHmac('sha512', this.apiSecret)
       .update(prehashString)
@@ -74,7 +69,8 @@ class GateIOService {
         url,
         headers: {
           'Content-Type': 'application/json',
-          'Accept': 'application/json'
+          'Accept': 'application/json',
+          'X-Gate-Size-Decimal': '1'  // Підтримка дробових розмірів
         }
       });
 
@@ -96,12 +92,10 @@ class GateIOService {
    * PRIVATE запит (з HMAC-SHA512 автентифікацією)
    */
   async privateRequest(method, endpoint, queryParams = {}, body = null) {
-    const timestamp = Math.floor(Date.now() / 1000).toString(); // ВАЖЛИВО: секунди, НЕ мілісекунди
+    const timestamp = Math.floor(Date.now() / 1000).toString();
 
-    // Resource path для підпису: /api/v4/futures/usdt/...
     const resourcePath = `${this.apiPrefix}${endpoint}`;
 
-    // Query string (ВАЖЛИВО: сортуємо ключі!)
     const queryString = Object.keys(queryParams).length > 0
       ? Object.keys(queryParams)
           .sort()
@@ -109,10 +103,8 @@ class GateIOService {
           .join('&')
       : '';
 
-    // Body string (для GET завжди пусто)
     const bodyString = body ? JSON.stringify(body) : '';
 
-    // Генеруємо підпис
     const signature = this.generateSignature(
       method,
       resourcePath,
@@ -121,16 +113,16 @@ class GateIOService {
       timestamp
     );
 
-    // Повний URL
     const url = `${this.baseURL}${resourcePath}${queryString ? '?' + queryString : ''}`;
 
-    // Headers згідно документації
+    // ВАЖЛИВО: X-Gate-Size-Decimal: 1 дозволяє дробові контракти
     const headers = {
       'KEY': this.apiKey,
       'Timestamp': timestamp,
       'SIGN': signature,
       'Content-Type': 'application/json',
-      'Accept': 'application/json'
+      'Accept': 'application/json',
+      'X-Gate-Size-Decimal': '1'  // ✅ Підтримка дробових розмірів (0.3 contracts)
     };
 
     try {
@@ -163,25 +155,16 @@ class GateIOService {
     }
   }
 
-  /**
-   * Конвертує BTCUSDT → BTC_USDT
-   */
   formatSymbol(symbol) {
     if (!symbol) return '';
     return symbol.replace('USDT', '_USDT');
   }
 
-  /**
-   * Конвертує BTC_USDT → BTCUSDT
-   */
   unformatSymbol(symbol) {
     if (!symbol) return '';
     return symbol.replace('_USDT', 'USDT');
   }
 
-  /**
-   * КРОК 1: PUBLIC TEST
-   */
   async testPublicConnection() {
     try {
       logger.info('');
@@ -205,9 +188,6 @@ class GateIOService {
     }
   }
 
-  /**
-   * КРОК 2: PRIVATE AUTH TEST
-   */
   async testPrivateConnection() {
     try {
       logger.info('');
@@ -231,9 +211,6 @@ class GateIOService {
     }
   }
 
-  /**
-   * CONNECT - головна точка входу
-   */
   async connect() {
     try {
       logger.info('');
@@ -243,11 +220,9 @@ class GateIOService {
       logger.info(`[GATEIO] Base URL: ${this.baseURL}${this.apiPrefix}`);
       logger.info(`[GATEIO] API Key: ${this.apiKey.substring(0, 20)}...`);
       logger.info(`[GATEIO] Position Mode: ${config.gateio.positionMode}`);
+      logger.info(`[GATEIO] Fractional Contracts: ENABLED (X-Gate-Size-Decimal: 1)`);
 
-      // КРОК 1: Public test
       await this.testPublicConnection();
-
-      // КРОК 2: Private auth test
       await this.testPrivateConnection();
 
       this.isConnected = true;
@@ -269,9 +244,6 @@ class GateIOService {
     }
   }
 
-  /**
-   * Отримує баланс
-   */
   async getUSDTBalance() {
     try {
       const account = await this.privateRequest('GET', '/futures/usdt/accounts');
@@ -284,19 +256,13 @@ class GateIOService {
     }
   }
 
-  /**
-   * Отримує інформацію про контракт
-   */
   async getSymbolInfo(symbol) {
     try {
       const contract = this.formatSymbol(symbol);
       const info = await this.publicRequest('GET', `/futures/usdt/contracts/${contract}`);
 
-      // order_size_min це МІНІМАЛЬНА кількість контрактів (INTEGER)
       const minQty = parseInt(info.order_size_min || '1');
       const maxQty = parseInt(info.order_size_max || '1000000');
-
-      // order_price_round для precision ціни
       const orderPriceRound = parseFloat(info.order_price_round || '0.01');
       const pricePrecision = Math.abs(Math.floor(Math.log10(orderPriceRound)));
 
@@ -305,10 +271,10 @@ class GateIOService {
         contract: info.name,
         minQty: minQty,
         maxQty: maxQty,
-        tickSize: minQty, // Для сумісності з існуючим кодом
+        tickSize: minQty,
         pricePrecision: pricePrecision,
         status: info.in_delisting ? 'Delisting' : 'Trading',
-        quantoMultiplier: parseFloat(info.quanto_multiplier || '0.0001') // Для конвертації USD → contracts
+        quantoMultiplier: parseFloat(info.quanto_multiplier || '0.0001')
       };
     } catch (error) {
       logger.error(`[GATEIO] Error getting symbol info: ${error.message}`);
@@ -316,9 +282,6 @@ class GateIOService {
     }
   }
 
-  /**
-   * Отримує поточну ціну
-   */
   async getCurrentPrice(symbol) {
     try {
       const contract = this.formatSymbol(symbol);
@@ -337,45 +300,29 @@ class GateIOService {
     }
   }
 
-  /**
-   * Встановлює leverage
-   * 
-   * ⚠️ ВАЖЛИВО: leverage передається як QUERY PARAMETER, НЕ в body!
-   * Правильний формат: POST /futures/usdt/positions/{contract}/leverage?leverage=20
-   * 
-   * Згідно офіційної документації Gate.io:
-   * https://www.gate.io/docs/developers/apiv4/en/
-   */
   async setLeverage(symbol, leverage) {
     try {
       logger.info(`[GATEIO] Setting leverage ${leverage}x for ${symbol}...`);
 
       const contract = this.formatSymbol(symbol);
-
-      // ✅ ВИПРАВЛЕНО: leverage як query parameter
       const queryParams = {
         leverage: leverage.toString()
       };
 
       if (config.gateio.positionMode === 'dual_mode') {
-        // Dual mode: окремо для long і short через інший метод
         try {
-          // Для dual mode використовуємо інший endpoint
           await this.privateRequest('POST', `/futures/usdt/dual_mode/positions/${contract}/leverage`, queryParams);
         } catch (error) {
-          // Якщо dual_mode endpoint не працює, пробуємо звичайний
           logger.warn('[GATEIO] Dual mode endpoint failed, trying regular...');
           await this.privateRequest('POST', `/futures/usdt/positions/${contract}/leverage`, queryParams);
         }
       } else {
-        // Single mode - БЕЗ body, тільки query params
         await this.privateRequest('POST', `/futures/usdt/positions/${contract}/leverage`, queryParams);
       }
 
       logger.info(`[GATEIO] ✓ Leverage ${leverage}x set`);
       return true;
     } catch (error) {
-      // Якщо leverage вже встановлений - OK
       if (error.response?.data?.label === 'INVALID_PARAM_VALUE') {
         logger.info(`[GATEIO] ✓ Leverage already ${leverage}x`);
         return true;
@@ -388,11 +335,8 @@ class GateIOService {
   /**
    * MARKET ORDER - відкриває позицію
    * 
-   * ВАЖЛИВО:
-   * - size має бути INTEGER (кількість контрактів, НЕ USDT!)
-   * - size > 0 для LONG, size < 0 для SHORT
-   * - price = "0" для market order
-   * - tif = "ioc" для market order
+   * ВАЖЛИВО: size може бути ДРОБОВИМ завдяки X-Gate-Size-Decimal: 1 header
+   * Приклад: size = 0.216 контрактів (для HYPE з балансом $12)
    */
   async openMarketOrder(symbol, side, quantity, direction) {
     try {
@@ -400,18 +344,19 @@ class GateIOService {
 
       const contract = this.formatSymbol(symbol);
 
-      // ВАЖЛИВО: size має бути INTEGER і знак визначає напрямок
+      // ВАЖЛИВО: size може бути FLOAT (дробовий)
+      // Знак визначає напрямок: додатний для LONG, від'ємний для SHORT
       const size = direction === 'LONG'
-        ? Math.abs(Math.floor(quantity))
-        : -Math.abs(Math.floor(quantity));
+        ? Math.abs(quantity)
+        : -Math.abs(quantity);
 
       const order = {
         contract: contract,
-        size: size,          // INTEGER: додатний для LONG, від'ємний для SHORT
-        price: '0',          // "0" для market згідно документації
+        size: size,          // FLOAT: 0.216 для LONG, -0.216 для SHORT
+        price: '0',          // "0" для market
         tif: 'ioc',          // immediate-or-cancel
-        text: `t-entry-${Date.now()}`,  // ВАЖЛИВО: має починатися з "t-"
-        reduce_only: false   // Відкриваємо нову позицію
+        text: `t-entry-${Date.now()}`,
+        reduce_only: false
       };
 
       logger.info(`[GATEIO] Order payload: ${JSON.stringify(order)}`);
@@ -437,11 +382,6 @@ class GateIOService {
 
   /**
    * TAKE PROFIT - limit ордер з reduce_only=true
-   * 
-   * ВАЖЛИВО:
-   * - reduce_only = true (закриває існуючу позицію)
-   * - size ПРОТИЛЕЖНИЙ напрямку позиції (LONG → negative, SHORT → positive)
-   * - tif = "gtc" (good-til-cancelled)
    */
   async setTakeProfitLimit(symbol, side, price, quantity, direction) {
     try {
@@ -449,18 +389,17 @@ class GateIOService {
 
       const contract = this.formatSymbol(symbol);
 
-      // Закриваємо позицію: LONG → sell (негативний), SHORT → buy (позитивний)
       const closeSize = direction === 'LONG'
-        ? -Math.abs(Math.floor(quantity))
-        : Math.abs(Math.floor(quantity));
+        ? -Math.abs(quantity)
+        : Math.abs(quantity);
 
       const order = {
         contract: contract,
-        size: closeSize,
+        size: closeSize,  // FLOAT дозволено
         price: price.toString(),
         tif: 'gtc',
-        reduce_only: true,  // ОБОВ'ЯЗКОВО для TP!
-        text: `t-tp-${Date.now()}`  // ВАЖЛИВО: має починатися з "t-"
+        reduce_only: true,
+        text: `t-tp-${Date.now()}`
       };
 
       logger.info(`[GATEIO] TP order payload: ${JSON.stringify(order)}`);
@@ -482,12 +421,6 @@ class GateIOService {
 
   /**
    * STOP LOSS - price-triggered order
-   * 
-   * ВАЖЛИВО:
-   * - використовуємо /futures/usdt/price_orders endpoint
-   * - trigger.price_type = 1 (mark price, безпечніше для SL)
-   * - trigger.rule: 1 для >= (SHORT SL), 2 для <= (LONG SL)
-   * - initial.reduce_only = true
    */
   async setStopLossLimit(symbol, side, price, quantity, direction) {
     try {
@@ -496,23 +429,23 @@ class GateIOService {
       const contract = this.formatSymbol(symbol);
 
       const closeSize = direction === 'LONG'
-        ? -Math.abs(Math.floor(quantity))
-        : Math.abs(Math.floor(quantity));
+        ? -Math.abs(quantity)
+        : Math.abs(quantity);
 
       const priceOrder = {
         initial: {
           contract: contract,
-          size: closeSize,
+          size: closeSize,  // FLOAT дозволено
           price: price.toString(),
           tif: 'gtc',
-          reduce_only: true,  // ОБОВ'ЯЗКОВО!
-          text: `t-sl-${Date.now()}`  // ВАЖЛИВО: має починатися з "t-"
+          reduce_only: true,
+          text: `t-sl-${Date.now()}`
         },
         trigger: {
-          strategy_type: 0,   // 0 = price trigger
-          price_type: 1,      // 1 = mark price (безпечніше)
+          strategy_type: 0,
+          price_type: 1,
           price: price.toString(),
-          rule: direction === 'LONG' ? 2 : 1  // LONG: <=, SHORT: >=
+          rule: direction === 'LONG' ? 2 : 1
         }
       };
 
@@ -533,9 +466,6 @@ class GateIOService {
     }
   }
 
-  /**
-   * Отримує відкриті позиції
-   */
   async getOpenPositions(symbol = null) {
     try {
       const queryParams = symbol ? { contract: this.formatSymbol(symbol) } : {};
@@ -563,17 +493,11 @@ class GateIOService {
     }
   }
 
-  /**
-   * Перевіряє чи є відкрита позиція
-   */
   async hasOpenPosition(symbol) {
     const positions = await this.getOpenPositions(symbol);
     return positions.length > 0;
   }
 
-  /**
-   * Отримує історію угод
-   */
   async getTradeHistory(symbol = null, limit = 50) {
     try {
       const queryParams = { limit: limit };
